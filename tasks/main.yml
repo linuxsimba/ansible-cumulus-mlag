@@ -1,0 +1,182 @@
+# vi: set ft=ansible :
+
+- name: set clag_is_configured variable that is later used by other roles
+  set_fact: clag_is_configured=1
+
+- name: get the number of switches called by the cumulus_mlag role
+  set_fact: mlag_count="{{mlag_hosts|length}}"
+
+- name: fail if number of hosts in mlag_hosts is 2
+  assert:
+    that: mlag_hosts|int == 2
+    msg: "Role should only have 2 switches {{ mlag_hosts }} {{ mlag_count }}"
+
+- name: |
+    create names for the server bond ports based on the name of the physical
+    interface
+  set_fact:
+    server_bonds: >
+      {%- set bonds = [] %}
+      {%- for entry in server %}
+      {%- set _ = bonds.append(['bond', entry.port]|join('')) %}
+      {%- endfor %}
+      {{- bonds -}}
+  tags: 'set_portlist'
+
+- name: create svi names for the vlan aware L3 interfaces
+  set_fact:
+    svi_names: >
+      {%- set sviface = [] %}
+      {%- for entry in svi %}
+      {%- set _ = sviface.append(['bridge.', entry.vlan]|join('')) %}
+      {%- endfor %}
+      {{- sviface -}}
+  tags: 'set_portlist'
+
+- name: create empty access ports
+  set_fact: access_ports="{{[] }}"
+
+- name: create list of access ports in the mlag domain
+  set_fact:
+    access_ports: >
+      {%- set ports = [] %}
+      {%- for entry in access[ansible_hostname] %}
+      {%- set _ = ports.append(entry.port) %}
+      {%- endfor %}
+      {{- ports -}}
+  when: access[ansible_hostname] is defined
+
+
+- name: create list of uplink ports to add
+  set_fact:
+    uplink_ports: >
+      {%- set ports = [] %}
+      {%- for entry in uplink_bonds %}
+      {%- set _ = ports.append(entry.port) %}
+      {%- endfor %}
+      {{- ports -}}
+  tags: 'set_portlist'
+
+- name: update portlist
+  set_fact: portlist="{{ portlist|list + svi_names + server_bonds + access_ports + ['peerlink', 'peerlink.4094', 'bridge'] + uplink_ports }}"
+  tags: set_portlist
+
+- name: set first switch in the list as the primary mlag
+  set_fact: primary_mlag_host={{ mlag_hosts[0] }}
+
+- name: set primary mlag priority
+  set_fact: mlag_priority_number=4096
+  when: inventory_hostname == primary_mlag_host
+
+- name: set primary peerlink ip
+  set_fact: primary_peerlink_ip='169.254.255.0/31'
+  when: inventory_hostname == primary_mlag_host
+
+- name: set primary peer ip
+  set_fact: primary_peer_ip='169.254.255.1'
+  when: inventory_hostname == primary_mlag_host
+
+- name: |
+   create primary peerlink bond. eth0 is set as backup link. If inband mgmt
+   is used then backup_ip link is not active
+  cl_bond:
+    mtu: 9000
+    name: "peerlink"
+    slaves: "{{peerlink.members}}"
+  notify:
+    - reload networking
+
+- name: |
+    assign peerlink ip port as peerlink.4094. Configure primary link with
+    169.254.255.0/31 address and secondary ip as 169.254.255.1/31
+    primary clagd priority is set to 4096 and secondary to 8192
+    ** no backup ip is configured so remains inactive**
+  cl_interface:
+    name: "peerlink.4094"
+    ipv4: "{{ primary_peerlink_ip|default('169.254.255.1/31') }}"
+    clagd_enable: 'yes'
+    clagd_priority: "{{ mlag_priority_number|default(8192)}}"
+    clagd_peer_ip: "{{ primary_peer_ip | default('169.254.255.0') }}"
+    clagd_backup_ip: ""
+    clagd_sys_mac: "{{ system_mac }}"
+  notify:
+    - reload networking
+
+- name: |
+    create uplink bond ports. create a "random" mlag id based on on the
+    interface name. mlag(clag) id should be the same on matching bond interfaces
+    across the mlag pair.
+  cl_bond:
+    mtu: 9000
+    name: "{{ item.port }}"
+    slaves: "{{ item.members }}"
+    vids: "{{ item.vids|default(omit) }}"
+    clag_id: "{{ ((item.port|checksum)|regex_replace('[a-z0]+', ''))[0:3] }}"
+    mstpctl_portnetwork: yes
+  with_items: "{{ uplink_bonds }}"
+  notify:
+    - reload networking
+
+
+- name: |
+    create server bond ports. create a "random" mlag id based on the interface
+    name. Sets the pvid to something different on this specific bond if needed
+  cl_bond:
+    mtu: 9000
+    alias_name: "{{ item.descr|default(omit) }}"
+    name: "bond{{ item.port }}"
+    slaves: "{{ item.port }}"
+    clag_id: "{{ ((item.port|checksum)|regex_replace('[a-z0]+', ''))[0:3] }}"
+    vids: "{{ item.vids|default(omit) }}"
+    mstpctl_bpduguard: yes
+    mstpctl_portadminedge: yes
+    lacp_bypass_allow: 1
+    ad_actor_sys_prio: 3000
+    pvid: "{{ item.pvid|default(omit)}}"
+  with_items: "{{ server }}"
+  notify:
+    - reload networking
+
+- name: |
+    access ports in the bridge but not part of mlag. set the default pvid to
+    that of the bridge if not defined.
+  cl_interface:
+    mtu: 9000
+    alias_name: "{{ item.descr|default(omit) }}"
+    name: "{{item.port}}"
+    vids: "{{item.vid| default(default_pvid) }}"
+    pvid: "{{item.vid| default(default_pvid) }}"
+    mstpctl_portadminedge: yes
+    mstpctl_bpduguard: yes
+  with_items: "{{ access[ansible_hostname] | default([]) }}"
+  notify:
+    - reload networking
+
+- name: |
+    create the main vlan aware bridge. define all vlans on that bridge
+  cl_bridge:
+    name: "bridge"
+    mtu: 9000
+    ports: "{{ server_bonds + access_ports + ['peerlink'] + uplink_ports }}"
+    vlan_aware: 'yes'
+    vids: "{{ vlan_range }}"
+    pvid: "{{ default_pvid }}"
+  notify:
+    - reload networking
+
+- name: increase SVI IP by 1 if it is a primary mlag switch
+  set_fact: ip_suffix=2
+  when: inventory_hostname == primary_mlag_host
+
+- name: |
+    configure SVI on vlan aware bridge. Set VRR default IP to the .1 address.
+  cl_interface:
+    mtu: 9000
+    alias_name: "{{ item.descr|default(omit) }}"
+    name: "bridge.{{item.vlan}}"
+    ipv4: "{{item.network|add_ip(ip_suffix|default(3))}}/{{ item.prefix}}"
+    virtual_ip: "{{item.network|add_ip(1)}}/{{ item.prefix}}"
+    virtual_mac: "00:00:5e:00:01:{{item.vlan|to_hex_mac_suffix|pad_zero(2)}}"
+  with_items: "{{ svi }}"
+  notify:
+    - reload networking

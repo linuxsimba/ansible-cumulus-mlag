@@ -1,0 +1,22 @@
+# List of uplink ports and their attributes
+# attributes:
+#  * port : bond port name (required)
+#  * members: bond slaves (required)
+# Example
+# uplink_ports:
+#  - { name: bond0, members: 'swp1-2' }
+uplink_ports: []
+
+
+# Hash of access orphan ports
+#Example:
+# access:
+#    leaf1:
+#      - { port: 10, vid: 10 }
+#    leaf2:
+#        - { port: 11, vid: 10 }
+#
+access: {}
+
+# Default pvid
+default_pvid: 1
